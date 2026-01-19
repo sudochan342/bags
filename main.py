@@ -33,6 +33,14 @@ from src.config import get_settings
 
 def setup_logging():
     """Configure structured logging."""
+    # Try to use colors, fall back to no colors if colorama not available
+    try:
+        import colorama
+        colorama.init()
+        use_colors = True
+    except ImportError:
+        use_colors = False
+
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -43,7 +51,7 @@ def setup_logging():
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
-            structlog.dev.ConsoleRenderer(colors=True),
+            structlog.dev.ConsoleRenderer(colors=use_colors),
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
