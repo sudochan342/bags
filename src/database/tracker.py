@@ -5,6 +5,7 @@ SQLite database for tracking tokens and alerts.
 import aiosqlite
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 import json
 import structlog
 
@@ -28,6 +29,10 @@ class TokenTracker:
 
     async def initialize(self):
         """Initialize database and create tables."""
+        # Ensure the data directory exists
+        db_dir = Path(self.db_path).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+
         self._db = await aiosqlite.connect(self.db_path)
 
         # Create tables
