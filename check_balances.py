@@ -30,6 +30,7 @@ def print_header():
     print("=" * 70)
     print("  Multi-Chain Balance Checker")
     print("  Supports: ETH keys, SOL keys, Seed phrases")
+    print("  Checks: Native balances + ERC-20/SPL tokens")
     print("=" * 70)
     print()
 
@@ -74,14 +75,25 @@ def print_result(result, only_with_balance: bool = False):
 
     # Group balances
     balances_with_funds = [b for b in result.balances if b.has_balance]
-    balances_empty = [b for b in result.balances if not b.has_balance and "Error" not in b.balance_formatted]
+    balances_with_tokens = [b for b in result.balances if b.tokens]
+    balances_empty = [b for b in result.balances if not b.has_balance and not b.tokens and "Error" not in b.balance_formatted]
     balances_error = [b for b in result.balances if "Error" in b.balance_formatted]
 
     if balances_with_funds:
-        print("  💰 FOUND BALANCE:")
+        print("  NATIVE BALANCE:")
         for bal in balances_with_funds:
             print(f"     {bal.chain_name}: {bal.balance_formatted} {bal.symbol}")
             print(f"       -> {bal.explorer_url}")
+
+    if balances_with_tokens:
+        print("  TOKENS:")
+        for bal in balances_with_tokens:
+            for token in bal.tokens:
+                usd_str = f" (${token.usd_value:.2f})" if token.usd_value else ""
+                print(f"     {bal.chain_name} | {token.token_symbol}: {token.balance_formatted}{usd_str}")
+                print(f"       Token: {token.token_name}")
+                if token.token_address:
+                    print(f"       Contract: {token.token_address[:20]}...")
 
     if not only_with_balance:
         if balances_empty:
@@ -145,6 +157,12 @@ Key file format (one key per line):
         "--no-solana",
         action="store_true",
         help="Skip Solana balance checks"
+    )
+
+    parser.add_argument(
+        "--no-tokens",
+        action="store_true",
+        help="Skip ERC-20 and SPL token balance checks (faster, native only)"
     )
 
     parser.add_argument(
@@ -224,13 +242,18 @@ Key file format (one key per line):
     checker = BalanceChecker(
         evm_chains=evm_chains,
         solana_clusters=solana_clusters,
-        timeout=args.timeout
+        timeout=args.timeout,
+        check_tokens=not args.no_tokens
     )
 
     chains_info = evm_chains or checker.evm_chains
     print(f"\nChecking balances on {len(chains_info)} EVM chain(s): {', '.join(chains_info)}")
     if solana_clusters:
         print(f"Checking Solana: {', '.join(solana_clusters)}")
+    if not args.no_tokens:
+        print("Token checking: ENABLED (ERC-20 + SPL tokens)")
+    else:
+        print("Token checking: DISABLED (native only)")
     print("\nThis may take a moment...")
     print()
 
@@ -244,6 +267,7 @@ Key file format (one key per line):
     # Print results
     wallets_with_balance = []
     total_chains_with_balance = 0
+    total_tokens = 0
 
     for result in results:
         if args.only_with_balance and not result.has_any_balance:
@@ -252,6 +276,7 @@ Key file format (one key per line):
         if result.has_any_balance:
             wallets_with_balance.append(result)
             total_chains_with_balance += result.total_chains_with_balance
+            total_tokens += result.total_tokens
 
     # Summary
     print()
@@ -261,6 +286,8 @@ Key file format (one key per line):
     print(f"  Total keys checked: {len(keys)}")
     print(f"  Wallets with balance: {len(wallets_with_balance)}")
     print(f"  Total chain balances found: {total_chains_with_balance}")
+    if total_tokens > 0:
+        print(f"  Total tokens found: {total_tokens}")
 
     if wallets_with_balance:
         print("\n  Wallets with funds:")
@@ -270,6 +297,9 @@ Key file format (one key per line):
                 if bal.has_balance:
                     print(f"    - {bal.chain_name}: {bal.balance_formatted} {bal.symbol}")
                     print(f"      {bal.explorer_url}")
+                for token in bal.tokens:
+                    usd_str = f" (${token.usd_value:.2f})" if token.usd_value else ""
+                    print(f"    - {bal.chain_name} | {token.token_symbol}: {token.balance_formatted}{usd_str}")
 
     return 0
 

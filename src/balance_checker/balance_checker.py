@@ -17,6 +17,19 @@ from .chains import (
 
 
 @dataclass
+class TokenBalance:
+    """Balance information for a specific token."""
+    chain_name: str
+    token_address: str
+    token_symbol: str
+    token_name: str
+    balance_raw: int
+    balance_formatted: str
+    decimals: int
+    usd_value: Optional[float] = None
+
+
+@dataclass
 class WalletBalance:
     """Balance information for a wallet on a specific chain."""
     chain_name: str
@@ -26,6 +39,7 @@ class WalletBalance:
     symbol: str
     explorer_url: str
     has_balance: bool
+    tokens: list[TokenBalance] = field(default_factory=list)
 
 
 @dataclass
@@ -39,21 +53,38 @@ class WalletResult:
 
     @property
     def has_any_balance(self) -> bool:
-        return any(b.has_balance for b in self.balances)
+        return any(b.has_balance or b.tokens for b in self.balances)
 
     @property
     def total_chains_with_balance(self) -> int:
-        return sum(1 for b in self.balances if b.has_balance)
+        return sum(1 for b in self.balances if b.has_balance or b.tokens)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(len(b.tokens) for b in self.balances)
 
 
 class BalanceChecker:
     """Check balances across multiple blockchain networks."""
 
+    # Ankr RPC endpoints for token balance queries (free tier available)
+    ANKR_ENDPOINTS = {
+        "ethereum": "https://rpc.ankr.com/eth",
+        "base": "https://rpc.ankr.com/base",
+        "arbitrum": "https://rpc.ankr.com/arbitrum",
+        "optimism": "https://rpc.ankr.com/optimism",
+        "polygon": "https://rpc.ankr.com/polygon",
+        "bsc": "https://rpc.ankr.com/bsc",
+        "avalanche": "https://rpc.ankr.com/avalanche",
+        "fantom": "https://rpc.ankr.com/fantom",
+    }
+
     def __init__(
         self,
         evm_chains: Optional[list[str]] = None,
         solana_clusters: Optional[list[str]] = None,
-        timeout: float = 10.0
+        timeout: float = 10.0,
+        check_tokens: bool = True
     ):
         """
         Initialize the balance checker.
@@ -62,10 +93,12 @@ class BalanceChecker:
             evm_chains: List of EVM chain keys to check (default: popular chains)
             solana_clusters: List of Solana cluster keys to check (default: mainnet)
             timeout: HTTP request timeout in seconds
+            check_tokens: Whether to also check ERC-20/SPL token balances
         """
         self.evm_chains = evm_chains or DEFAULT_EVM_CHAINS
         self.solana_clusters = solana_clusters or DEFAULT_SOLANA_CLUSTERS
         self.timeout = timeout
+        self.check_tokens = check_tokens
 
     def _derive_eth_address(self, private_key: str) -> str:
         """Derive Ethereum address from private key."""
@@ -236,6 +269,136 @@ class BalanceChecker:
                 has_balance=False
             )
 
+    async def _check_evm_tokens(
+        self,
+        client: httpx.AsyncClient,
+        address: str,
+        chain_key: str,
+        chain: EVMChain
+    ) -> list[TokenBalance]:
+        """Check ERC-20 token balances using Ankr API."""
+        tokens = []
+
+        if chain_key not in self.ANKR_ENDPOINTS:
+            return tokens
+
+        try:
+            # Use Ankr's advanced API for token balances
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "ankr_getAccountBalance",
+                "params": {
+                    "blockchain": chain_key if chain_key != "bsc" else "bsc",
+                    "walletAddress": address,
+                    "onlyWhitelisted": False
+                },
+                "id": 1
+            }
+
+            response = await client.post(
+                "https://rpc.ankr.com/multichain",
+                json=payload,
+                timeout=self.timeout
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                assets = data.get("result", {}).get("assets", [])
+
+                for asset in assets:
+                    # Skip native token (already handled)
+                    if asset.get("tokenType") == "NATIVE":
+                        continue
+
+                    balance_raw = int(asset.get("balanceRawInteger", "0"))
+                    if balance_raw == 0:
+                        continue
+
+                    decimals = asset.get("tokenDecimals", 18)
+                    balance_formatted = f"{Decimal(balance_raw) / Decimal(10 ** decimals):.6f}"
+
+                    tokens.append(TokenBalance(
+                        chain_name=chain.name,
+                        token_address=asset.get("contractAddress", ""),
+                        token_symbol=asset.get("tokenSymbol", "???"),
+                        token_name=asset.get("tokenName", "Unknown"),
+                        balance_raw=balance_raw,
+                        balance_formatted=balance_formatted,
+                        decimals=decimals,
+                        usd_value=float(asset.get("balanceUsd", 0)) if asset.get("balanceUsd") else None
+                    ))
+
+        except Exception:
+            # Token check failed, but we still have native balance
+            pass
+
+        return tokens
+
+    async def _check_solana_tokens(
+        self,
+        client: httpx.AsyncClient,
+        address: str,
+        cluster: SolanaCluster
+    ) -> list[TokenBalance]:
+        """Check SPL token balances on Solana."""
+        tokens = []
+
+        try:
+            # Get all token accounts for this wallet
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    address,
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding": "jsonParsed"}
+                ],
+                "id": 1
+            }
+
+            response = await client.post(
+                cluster.rpc_url,
+                json=payload,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if "error" in data:
+                return tokens
+
+            accounts = data.get("result", {}).get("value", [])
+
+            for account in accounts:
+                try:
+                    parsed = account.get("account", {}).get("data", {}).get("parsed", {})
+                    info = parsed.get("info", {})
+                    token_amount = info.get("tokenAmount", {})
+
+                    balance_raw = int(token_amount.get("amount", "0"))
+                    if balance_raw == 0:
+                        continue
+
+                    decimals = token_amount.get("decimals", 0)
+                    ui_amount = token_amount.get("uiAmountString", "0")
+
+                    tokens.append(TokenBalance(
+                        chain_name=cluster.name,
+                        token_address=info.get("mint", ""),
+                        token_symbol="SPL",  # Would need token registry for actual symbol
+                        token_name=info.get("mint", "")[:8] + "...",
+                        balance_raw=balance_raw,
+                        balance_formatted=ui_amount,
+                        decimals=decimals
+                    ))
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return tokens
+
     async def check_wallet(self, key: DetectedKey) -> WalletResult:
         """
         Check balance for a single wallet across all configured chains.
@@ -296,6 +459,38 @@ class BalanceChecker:
                 # Run all balance checks concurrently
                 if tasks:
                     result.balances = await asyncio.gather(*tasks)
+
+                # Check for tokens if enabled
+                if self.check_tokens and result.balances:
+                    token_tasks = []
+
+                    # EVM token checks
+                    if result.address_evm:
+                        for chain_key in self.evm_chains:
+                            if chain_key in EVM_CHAINS:
+                                chain = EVM_CHAINS[chain_key]
+                                token_tasks.append(
+                                    self._check_evm_tokens(client, result.address_evm, chain_key, chain)
+                                )
+
+                    # Solana token checks
+                    if result.address_solana:
+                        for cluster_key in self.solana_clusters:
+                            if cluster_key in SOLANA_CLUSTERS:
+                                cluster = SOLANA_CLUSTERS[cluster_key]
+                                token_tasks.append(
+                                    self._check_solana_tokens(client, result.address_solana, cluster)
+                                )
+
+                    if token_tasks:
+                        token_results = await asyncio.gather(*token_tasks)
+
+                        # Match tokens to their corresponding balance entries
+                        token_idx = 0
+                        for balance in result.balances:
+                            if token_idx < len(token_results):
+                                balance.tokens = token_results[token_idx]
+                                token_idx += 1
 
         except Exception as e:
             result.error = str(e)
