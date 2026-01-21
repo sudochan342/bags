@@ -37,9 +37,10 @@ class KeyDetector:
     # Ethereum: 64 hex chars (with or without 0x)
     ETH_HEX_PATTERN = re.compile(r'(?:0x)?([a-fA-F0-9]{64})(?![a-fA-F0-9])')
 
-    # Solana base58: 43-88 chars of base58 alphabet
-    # 44 chars = public key, 64 chars = some formats, 87-88 = full keypair
-    SOLANA_BASE58_PATTERN = re.compile(r'(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{43,88})(?![1-9A-HJ-NP-Za-km-z])')
+    # Solana base58: various lengths depending on format
+    # 44 chars = public key (32 bytes), 87-88 = full keypair (64 bytes)
+    # Be more lenient - accept 32-128 char base58 strings
+    SOLANA_BASE58_PATTERN = re.compile(r'(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{32,128})(?![1-9A-HJ-NP-Za-km-z])')
 
     # JSON array pattern for Solana keys
     JSON_ARRAY_PATTERN = re.compile(r'\[[\s\d,]+\]')
@@ -129,12 +130,12 @@ class KeyDetector:
             # Remove non-base58 chars from start/end
             candidate = candidate.strip()
 
-            if len(candidate) >= 43 and len(candidate) <= 88:
+            if len(candidate) >= 32 and len(candidate) <= 128:
                 # Check if it's valid base58
                 try:
                     decoded = base58.b58decode(candidate)
-                    # Solana keypairs are 64 bytes, but we also accept 32 (seed)
-                    if len(decoded) in [32, 64]:
+                    # Accept various Solana key formats (32-64 bytes)
+                    if len(decoded) >= 32 and len(decoded) <= 64:
                         return True
                 except Exception:
                     pass
@@ -179,10 +180,26 @@ class KeyDetector:
         for candidate in matches:
             try:
                 decoded = base58.b58decode(candidate)
-                if len(decoded) in [32, 64]:
+                # Accept 32 bytes (seed/secret), 64 bytes (full keypair), or other valid lengths
+                if len(decoded) >= 32 and len(decoded) <= 64:
                     return candidate
             except Exception:
                 continue
+
+        # Also try the whole line stripped as base58
+        stripped = line.strip()
+        # Remove common prefixes
+        for prefix in ['sol:', 'solana:', 'key:', 'pk:', 'private:']:
+            if stripped.lower().startswith(prefix):
+                stripped = stripped[len(prefix):].strip()
+
+        if len(stripped) >= 32:
+            try:
+                decoded = base58.b58decode(stripped)
+                if len(decoded) >= 32 and len(decoded) <= 64:
+                    return stripped
+            except Exception:
+                pass
 
         return None
 
