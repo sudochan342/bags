@@ -1,10 +1,9 @@
 """Key type detection for various blockchain formats."""
 
 import re
-import base64
+import json
 import base58
 from enum import Enum
-from typing import Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -34,25 +33,21 @@ class KeyDetector:
     # BIP-39 word list (partial for validation - we check word count and format)
     SEED_PHRASE_WORD_COUNTS = [12, 15, 18, 21, 24]
 
-    # Ethereum private key pattern (64 hex chars, optionally with 0x prefix)
-    ETH_PRIVATE_KEY_PATTERN = re.compile(r'^(0x)?[a-fA-F0-9]{64}$')
+    # Patterns for extracting potential keys from messy text
+    # Ethereum: 64 hex chars (with or without 0x)
+    ETH_HEX_PATTERN = re.compile(r'(?:0x)?([a-fA-F0-9]{64})(?![a-fA-F0-9])')
 
-    # Solana private key patterns
-    # Base58 encoded (87-88 chars typically)
-    SOLANA_BASE58_PATTERN = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$')
-    # JSON array format [1,2,3,...] (64 bytes)
-    SOLANA_JSON_ARRAY_PATTERN = re.compile(r'^\s*\[\s*(\d+\s*,\s*){63}\d+\s*\]\s*$')
+    # Solana base58: 43-88 chars of base58 alphabet
+    # 44 chars = public key, 64 chars = some formats, 87-88 = full keypair
+    SOLANA_BASE58_PATTERN = re.compile(r'(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{43,88})(?![1-9A-HJ-NP-Za-km-z])')
+
+    # JSON array pattern for Solana keys
+    JSON_ARRAY_PATTERN = re.compile(r'\[[\s\d,]+\]')
 
     @classmethod
     def detect_key_type(cls, value: str) -> KeyType:
         """
         Detect the type of key from its string representation.
-
-        Args:
-            value: The key string to analyze
-
-        Returns:
-            KeyType enum value
         """
         value = value.strip()
 
@@ -76,7 +71,9 @@ class KeyDetector:
     @classmethod
     def _is_seed_phrase(cls, value: str) -> bool:
         """Check if value looks like a BIP-39 seed phrase."""
-        words = value.lower().split()
+        # Clean up - remove extra whitespace, common separators
+        cleaned = re.sub(r'[,;|\-_]+', ' ', value)
+        words = cleaned.lower().split()
 
         # Must have valid word count
         if len(words) not in cls.SEED_PHRASE_WORD_COUNTS:
@@ -94,43 +91,128 @@ class KeyDetector:
     @classmethod
     def _is_eth_private_key(cls, value: str) -> bool:
         """Check if value is an Ethereum private key."""
-        return bool(cls.ETH_PRIVATE_KEY_PATTERN.match(value))
+        # Remove common prefixes/labels
+        cleaned = re.sub(r'^.*?(?:key|pk|private|eth|evm|0x)[\s:=]*', '', value, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
 
-    @classmethod
-    def _is_solana_private_key(cls, value: str) -> bool:
-        """Check if value is a Solana private key."""
-        # Check base58 format
-        if cls.SOLANA_BASE58_PATTERN.match(value):
-            try:
-                decoded = base58.b58decode(value)
-                # Solana keypairs are 64 bytes (32 private + 32 public)
-                if len(decoded) == 64:
-                    return True
-            except Exception:
-                pass
+        # Check for 64 hex chars (with or without 0x)
+        if cleaned.startswith('0x'):
+            cleaned = cleaned[2:]
 
-        # Check JSON array format
-        if cls.SOLANA_JSON_ARRAY_PATTERN.match(value):
-            try:
-                import json
-                arr = json.loads(value)
-                if len(arr) == 64 and all(isinstance(x, int) and 0 <= x <= 255 for x in arr):
-                    return True
-            except Exception:
-                pass
+        if len(cleaned) == 64 and all(c in '0123456789abcdefABCDEF' for c in cleaned):
+            return True
 
         return False
 
     @classmethod
+    def _is_solana_private_key(cls, value: str) -> bool:
+        """Check if value is a Solana private key."""
+        # Check JSON array format first
+        if '[' in value and ']' in value:
+            try:
+                # Extract JSON array from the line
+                match = cls.JSON_ARRAY_PATTERN.search(value)
+                if match:
+                    arr = json.loads(match.group())
+                    if len(arr) == 64 and all(isinstance(x, int) and 0 <= x <= 255 for x in arr):
+                        return True
+            except Exception:
+                pass
+
+        # Check base58 format - extract potential base58 string
+        # Remove common labels
+        cleaned = re.sub(r'^.*?(?:key|pk|private|sol|solana)[\s:=]*', '', value, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+
+        # Try to find base58 string
+        for candidate in [cleaned, value]:
+            # Remove non-base58 chars from start/end
+            candidate = candidate.strip()
+
+            if len(candidate) >= 43 and len(candidate) <= 88:
+                # Check if it's valid base58
+                try:
+                    decoded = base58.b58decode(candidate)
+                    # Solana keypairs are 64 bytes, but we also accept 32 (seed)
+                    if len(decoded) in [32, 64]:
+                        return True
+                except Exception:
+                    pass
+
+        return False
+
+    @classmethod
+    def _extract_eth_key(cls, line: str) -> str | None:
+        """Try to extract an Ethereum private key from a messy line."""
+        # First try direct match
+        cleaned = line.strip()
+        if cleaned.startswith('0x'):
+            cleaned = cleaned[2:]
+        if len(cleaned) == 64 and all(c in '0123456789abcdefABCDEF' for c in cleaned):
+            return line.strip()
+
+        # Try regex extraction
+        match = cls.ETH_HEX_PATTERN.search(line)
+        if match:
+            hex_str = match.group(1)
+            # Return with 0x prefix for consistency
+            return '0x' + hex_str
+
+        return None
+
+    @classmethod
+    def _extract_solana_key(cls, line: str) -> str | None:
+        """Try to extract a Solana private key from a messy line."""
+        # Check JSON array first
+        if '[' in line and ']' in line:
+            match = cls.JSON_ARRAY_PATTERN.search(line)
+            if match:
+                try:
+                    arr = json.loads(match.group())
+                    if len(arr) == 64 and all(isinstance(x, int) and 0 <= x <= 255 for x in arr):
+                        return match.group()
+                except Exception:
+                    pass
+
+        # Try base58 extraction
+        matches = cls.SOLANA_BASE58_PATTERN.findall(line)
+        for candidate in matches:
+            try:
+                decoded = base58.b58decode(candidate)
+                if len(decoded) in [32, 64]:
+                    return candidate
+            except Exception:
+                continue
+
+        return None
+
+    @classmethod
+    def _extract_seed_phrase(cls, line: str) -> str | None:
+        """Try to extract a seed phrase from a messy line."""
+        # Clean up separators
+        cleaned = re.sub(r'[,;|\-_]+', ' ', line)
+        # Remove common labels
+        cleaned = re.sub(r'^.*?(?:seed|mnemonic|phrase|words?)[\s:=]*', '', cleaned, flags=re.IGNORECASE)
+        cleaned = ' '.join(cleaned.split())  # Normalize whitespace
+
+        if cls._is_seed_phrase(cleaned):
+            return cleaned
+
+        # Try to find word sequences
+        words = re.findall(r'\b([a-zA-Z]{3,8})\b', line)
+        for start in range(len(words)):
+            for count in cls.SEED_PHRASE_WORD_COUNTS:
+                if start + count <= len(words):
+                    candidate = ' '.join(words[start:start + count])
+                    if cls._is_seed_phrase(candidate):
+                        return candidate
+
+        return None
+
+    @classmethod
     def parse_keys_from_file(cls, filepath: str) -> list[DetectedKey]:
         """
-        Parse a file and detect all keys.
-
-        Args:
-            filepath: Path to the file containing keys
-
-        Returns:
-            List of DetectedKey objects
+        Parse a file and detect all keys with flexible extraction.
         """
         detected_keys = []
 
@@ -139,30 +221,55 @@ class KeyDetector:
                 line = line.strip()
 
                 # Skip empty lines and comments
-                if not line or line.startswith('#'):
+                if not line or line.startswith('#') or line.startswith('//'):
                     continue
 
-                key_type = cls.detect_key_type(line)
-
-                if key_type != KeyType.UNKNOWN:
-                    detected_keys.append(DetectedKey(
-                        key_type=key_type,
-                        raw_value=line,
-                        line_number=line_num
-                    ))
+                keys_found = cls._extract_keys_from_line(line, line_num)
+                detected_keys.extend(keys_found)
 
         return detected_keys
+
+    @classmethod
+    def _extract_keys_from_line(cls, line: str, line_num: int) -> list[DetectedKey]:
+        """Extract all possible keys from a single line."""
+        found = []
+
+        # Try seed phrase first (takes precedence - most words)
+        seed = cls._extract_seed_phrase(line)
+        if seed:
+            found.append(DetectedKey(
+                key_type=KeyType.SEED_PHRASE,
+                raw_value=seed,
+                line_number=line_num
+            ))
+            return found  # Seed phrase consumes the whole line
+
+        # Try Ethereum key
+        eth = cls._extract_eth_key(line)
+        if eth:
+            found.append(DetectedKey(
+                key_type=KeyType.ETH_PRIVATE_KEY,
+                raw_value=eth,
+                line_number=line_num
+            ))
+            return found
+
+        # Try Solana key
+        sol = cls._extract_solana_key(line)
+        if sol:
+            found.append(DetectedKey(
+                key_type=KeyType.SOLANA_PRIVATE_KEY,
+                raw_value=sol,
+                line_number=line_num
+            ))
+            return found
+
+        return found
 
     @classmethod
     def parse_keys_from_text(cls, text: str) -> list[DetectedKey]:
         """
         Parse text content and detect all keys.
-
-        Args:
-            text: Text content containing keys (one per line)
-
-        Returns:
-            List of DetectedKey objects
         """
         detected_keys = []
 
@@ -170,16 +277,10 @@ class KeyDetector:
             line = line.strip()
 
             # Skip empty lines and comments
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or line.startswith('//'):
                 continue
 
-            key_type = cls.detect_key_type(line)
-
-            if key_type != KeyType.UNKNOWN:
-                detected_keys.append(DetectedKey(
-                    key_type=key_type,
-                    raw_value=line,
-                    line_number=line_num
-                ))
+            keys_found = cls._extract_keys_from_line(line, line_num)
+            detected_keys.extend(keys_found)
 
         return detected_keys
