@@ -25,3 +25,9 @@ ratelimit>=2.2.0
 
 # WebSocket for real-time data (optional)
 websockets>=11.0
+
+# Multi-chain balance checker dependencies
+eth-account>=0.10.0  # Ethereum key derivation
+base58>=2.1.0        # Solana key encoding
+solders>=0.20.0      # Solana keypair handling
+mnemonic>=0.20       # BIP-39 seed phrase support
